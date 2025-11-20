@@ -6,67 +6,113 @@ import os
 
 # 1. 페이지 기본 설정
 st.set_page_config(page_title="중·고등 학적 파트너", page_icon="🏫", layout="centered")
-st.title("🏫 중·고등 학적 파트너 (Direct API)")
-st.info("라이브러리 없이 구글 서버와 직접 통신합니다. (PDF 분석 포함)")
+st.title("🏫 학적 파트너 (자동 연결 모드)")
 
 # 2. API 키 확인
 if "GEMINI_API_KEY" not in st.secrets:
-    st.error("비밀 키(Secrets)가 설정되지 않았습니다.")
+    st.error("🚨 Secrets에 GEMINI_API_KEY가 설정되지 않았습니다.")
     st.stop()
 
 API_KEY = st.secrets["GEMINI_API_KEY"]
 
-# 3. 시스템 프롬프트
+# 3. [핵심] 사용 가능한 모델 자동 탐색 함수
+@st.cache_resource
+def find_working_model(api_key):
+    # 구글에 "내 키로 쓸 수 있는 모델 목록 보여줘" 요청
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            return None, response.json() # 에러 발생
+        
+        data = response.json()
+        # 'generateContent' 기능을 지원하는 모델만 필터링
+        available_models = [
+            m['name'] for m in data.get('models', [])
+            if 'generateContent' in m.get('supportedGenerationMethods', [])
+        ]
+        
+        # 우선순위: 1.5 Flash -> 1.5 Pro -> 1.0 Pro 순서로 찾음
+        preferred_order = ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-pro']
+        
+        for model in preferred_order:
+            if model in available_models:
+                return model, available_models
+        
+        # 우선순위 모델이 없으면 아무거나 첫 번째 것 선택
+        if available_models:
+            return available_models[0], available_models
+            
+        return None, "사용 가능한 모델이 없습니다. (API 설정 확인 필요)"
+        
+    except Exception as e:
+        return None, str(e)
+
+# 4. 모델 탐색 실행
+with st.spinner("🔑 API 키 권한 및 사용 가능 모델 확인 중..."):
+    selected_model, debug_info = find_working_model(API_KEY)
+
+# 5. 진단 결과 처리 (여기가 중요합니다!)
+if selected_model:
+    st.success(f"✅ 연결 성공! 현재 사용 중인 모델: **{selected_model}**")
+else:
+    st.error("🚫 치명적 오류: API 키는 맞지만, 사용할 수 있는 모델이 없습니다.")
+    
+    # 상세 원인 분석
+    if isinstance(debug_info, dict) and 'error' in debug_info:
+        err_msg = debug_info['error'].get('message', '')
+        st.error(f"구글 서버 메시지: {err_msg}")
+        
+        if "API has not been used" in err_msg or "not enabled" in err_msg:
+            st.warning("""
+            [해결 방법]
+            선생님, 구글 클라우드 콘솔에서 **'Generative Language API'**가 꺼져 있습니다.
+            1. Google Cloud Console 접속
+            2. 검색창에 'Generative Language API' 검색
+            3. **'ENABLE(사용)'** 버튼 클릭
+            4. 5분 뒤 다시 접속하면 해결됩니다.
+            """)
+    else:
+        st.code(debug_info)
+    st.stop()
+
+# 6. 채팅 로직 (선택된 모델로 대화)
 SYSTEM_PROMPT = """
 당신은 학교 학적 업무를 지원하는 전문 어시스턴트입니다.
-제공된 PDF 문서의 내용을 기반으로 답변해야 하며, 답변 끝에는 반드시 근거(문서명, 페이지)를 명시해야 합니다.
-문서에 없는 내용은 "문서에서 찾을 수 없습니다"라고 답변하세요.
+답변 끝에는 반드시 근거(문서명, 페이지)를 명시해야 합니다.
 """
 
-# 4. 직접 통신 함수 (라이브러리 X)
-def call_gemini_direct(prompt, pdf_files):
-    # 1) 사용할 모델 주소 (최신 1.5 Flash 모델 사용)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+def call_gemini(prompt, pdf_files, model_name):
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={API_KEY}"
     
-    # 2) 보낼 데이터 조립
     parts = [{"text": SYSTEM_PROMPT}, {"text": f"질문: {prompt}"}]
     
-    # PDF 파일들을 base64 코드로 변환해서 첨부
-    for pdf_path in pdf_files:
-        try:
-            with open(pdf_path, "rb") as f:
-                pdf_data = base64.b64encode(f.read()).decode("utf-8")
-                parts.append({
-                    "inline_data": {
-                        "mime_type": "application/pdf",
-                        "data": pdf_data
-                    }
-                })
-        except Exception as e:
-            st.error(f"파일 읽기 실패 ({pdf_path}): {e}")
+    # PDF 첨부 (모델이 1.5 버전일 때만 가능, 1.0은 텍스트만)
+    is_vision_model = "1.5" in model_name
+    if is_vision_model:
+        for pdf_path in pdf_files:
+            try:
+                with open(pdf_path, "rb") as f:
+                    pdf_data = base64.b64encode(f.read()).decode("utf-8")
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": "application/pdf",
+                            "data": pdf_data
+                        }
+                    })
+            except:
+                pass
+    elif pdf_files:
+        st.toast("⚠️ 현재 연결된 모델(Gemini Pro)은 PDF 직접 읽기를 지원하지 않습니다. 텍스트로 질문해주세요.", icon="ℹ️")
 
-    payload = {
-        "contents": [{"parts": parts}]
-    }
-
-    # 3) 전송 (POST 요청)
+    payload = {"contents": [{"parts": parts}]}
     response = requests.post(url, headers={"Content-Type": "application/json"}, data=json.dumps(payload))
-    
     return response
 
-# 5. 현재 폴더의 PDF 찾기
+# PDF 파일 찾기
 pdf_files = [f for f in os.listdir('.') if f.lower().endswith('.pdf')]
 
-# 사이드바 표시
-with st.sidebar:
-    st.header("📂 문서 목록")
-    if pdf_files:
-        for f in pdf_files:
-            st.success(f"📄 {f}")
-    else:
-        st.warning("PDF 파일이 없습니다.")
-
-# 6. 채팅 인터페이스
+# 채팅 UI
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -81,27 +127,17 @@ if prompt := st.chat_input("질문을 입력하세요..."):
 
     with st.chat_message("assistant"):
         msg_box = st.empty()
-        msg_box.markdown("직통 회선으로 연결 중... 📡")
+        msg_box.markdown("답변 생성 중... ⏳")
         
         try:
-            # 함수 호출
-            res = call_gemini_direct(prompt, pdf_files)
+            res = call_gemini(prompt, pdf_files, selected_model)
             
             if res.status_code == 200:
-                # 성공 시
-                result_json = res.json()
-                try:
-                    answer = result_json["candidates"][0]["content"]["parts"][0]["text"]
-                    msg_box.markdown(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                except:
-                    msg_box.error("답변을 해석할 수 없습니다. (안전 필터 등)")
-                    st.json(result_json) # 디버깅용 원본 출력
+                answer = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                msg_box.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
             else:
-                # 실패 시 (여기가 진짜 중요합니다. 구글이 보낸 진짜 에러 메시지를 보여줌)
-                error_msg = res.json().get("error", {}).get("message", "알 수 없는 오류")
-                msg_box.error(f"❌ 구글 서버 거부: {res.status_code}")
-                msg_box.code(error_msg) # 에러 내용 그대로 출력
-                
+                msg_box.error(f"오류 발생: {res.status_code}")
+                msg_box.json(res.json())
         except Exception as e:
-            msg_box.error(f"전송 중 오류 발생: {e}")
+            msg_box.error(f"통신 오류: {e}")
