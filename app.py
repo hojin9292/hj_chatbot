@@ -65,7 +65,7 @@ def load_pdfs_and_configure_model():
         # 모델 설정 (시스템 프롬프트 + 파일 포함)
         # Gemini 1.5 Flash 모델 사용 (긴 문맥 처리에 최적화)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-pro",
             system_instruction=SYSTEM_INSTRUCTION
         )
         
@@ -132,3 +132,4 @@ if prompt := st.chat_input("궁금한 학적 규정을 입력하세요..."):
             
         except Exception as e:
             message_placeholder.error(f"오류가 발생했습니다: {e}")
+
